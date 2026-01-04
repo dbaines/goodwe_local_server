@@ -1,0 +1,9 @@
+{
+  "name": "GoodWe Local Server",
+  "domain": "goodwe_local_server",
+  "version": "0.1",
+  "iot_class": "local_push",
+  "requirements": ["simple-hexdump"],
+  "config_flow": true,
+  "single_config_entry": true
+}
