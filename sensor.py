@@ -70,7 +70,7 @@ async def async_setup_entry( hass, config_entry, async_add_entities ):
             plaintext = cipher.decrypt( ciphertext )
             log.debug(f"plaintext:\n{hexdump(plaintext)}")
 
-        if packet_type == b'\03\04' and model == '93000HKU':
+        if packet_type == b'\x03\x04' and model in ('93000HKU', '91000HKU'):
             await handle_93000HKU_meter_metrics( packet, plaintext )
         elif packet_type == b'\01\04' and model == '58000DTA':
             await handle_58000DTA_inverter_metrics( packet, plaintext )
