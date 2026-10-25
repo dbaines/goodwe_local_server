@@ -2,23 +2,29 @@ import asyncio
 import logging
 import re
 
+import aiohttp
+
 from hexdump import hexdump
 from time import time
 from Crypto.Cipher import AES
 
 from homeassistant.components.sensor import SensorEntity, SensorEntityDescription, SensorDeviceClass, SensorStateClass
 from homeassistant.const import EntityCategory
+from homeassistant.helpers.aiohttp_client import async_get_clientsession
 from homeassistant.helpers.device_registry import DeviceInfo
 
+from .const import DOMAIN, CONF_RELAY, CONF_RELAY_REPLIES
 
-DOMAIN = "goodwe_local_server"
 
 SERVER_HOST = '0.0.0.0'
 SERVER_PORT = 20001
 
-GOODWE_RELAY = False
+# Relaying to GoodWe (SEMS) is switched on in the integration's options (Configure)
 GOODWE_HOST = 'tcp.goodwe-power.com'
 GOODWE_PORT = 20001
+GOODWE_RELAY_TIMEOUT = 10       # Seconds to connect / wait for a reply
+GOODWE_DOH_URL = 'https://1.1.1.1/dns-query'  # Resolve GOODWE_HOST here, bypassing the local DNS rewrite
+GOODWE_DNS_TTL = 3600
 
 AES_KEY = b'\xff' * 16
 
@@ -31,6 +37,7 @@ async def async_setup_entry( hass, config_entry, async_add_entities ):
 
     device_sensors = {}
     device_timestamps = {}
+    relay_state = { 'ip': None, 'resolved_at': 0, 'failing': False }
 
     async def start_server():
         server = await asyncio.start_server(
@@ -77,6 +84,65 @@ async def async_setup_entry( hass, config_entry, async_add_entities ):
                 pass
 
 
+    async def resolve_goodwe_host():
+        """Look up GoodWe's real server over DNS-over-HTTPS, so a local DNS
+        rewrite pointing GOODWE_HOST at HA doesn't make the relay loop back to itself."""
+        if relay_state['ip'] and time() - relay_state['resolved_at'] < GOODWE_DNS_TTL:
+            return relay_state['ip']
+        try:
+            session = async_get_clientsession( hass )
+            async with session.get(
+                GOODWE_DOH_URL,
+                params = { 'name': GOODWE_HOST, 'type': 'A' },
+                headers = { 'accept': 'application/dns-json' },
+                timeout = aiohttp.ClientTimeout( total=GOODWE_RELAY_TIMEOUT )
+            ) as resp:
+                data = await resp.json( content_type=None )
+            ips = [ answer['data'] for answer in data.get('Answer', []) if answer.get('type') == 1 ]
+            if ips:
+                relay_state['ip'] = ips[0]
+                relay_state['resolved_at'] = time()
+                log.debug(f"Resolved {GOODWE_HOST} to {ips[0]}")
+        except Exception as err:
+            log.debug(f"Could not resolve {GOODWE_HOST}: {type(err).__name__}: {err}")
+        return relay_state['ip']  # Last known address if the lookup failed
+
+
+    async def relay_packet( packet, writer, addr ):
+        """Forward a packet to GoodWe's server. Failures are logged, never raised,
+        so local processing doesn't depend on the internet or GoodWe."""
+        gw_writer = None
+        try:
+            ip = await resolve_goodwe_host()
+            if ip is None:
+                raise OSError(f"no address for {GOODWE_HOST}")
+            gw_reader, gw_writer = await asyncio.wait_for(
+                asyncio.open_connection( ip, GOODWE_PORT ), GOODWE_RELAY_TIMEOUT )
+            gw_writer.write( packet )
+            await gw_writer.drain()
+            log.debug(f"Relayed packet from {addr} to {[GOODWE_HOST, ip, GOODWE_PORT]}")
+            reply = await asyncio.wait_for( gw_reader.read(1024), GOODWE_RELAY_TIMEOUT )
+            log.debug(f"Received reply:\n{hexdump(reply)}")
+            if reply and config_entry.options.get( CONF_RELAY_REPLIES, False ):
+                writer.write( reply )
+                await writer.drain()
+            if relay_state['failing']:
+                log.info(f"Relay to {GOODWE_HOST} working again")
+                relay_state['failing'] = False
+        except (OSError, asyncio.TimeoutError) as err:
+            # Warn once per outage, not for every packet
+            level = logging.DEBUG if relay_state['failing'] else logging.WARNING
+            log.log( level, f"Relay to {GOODWE_HOST} failed: {type(err).__name__}: {err}")
+            relay_state['failing'] = True
+        finally:
+            if gw_writer is not None:
+                gw_writer.close()
+                try:
+                    await gw_writer.wait_closed()
+                except Exception:
+                    pass
+
+
     async def process_packet( reader, writer, addr ):
         packet = await read_full_packet( reader )
         log.debug(f"\n\n\nReceived packet from {addr}:\n{hexdump(packet)}")
@@ -85,14 +151,16 @@ async def async_setup_entry( hass, config_entry, async_add_entities ):
             log.debug(f"Empty packet from {addr}")
             return
 
-        if len(packet) and GOODWE_RELAY:
-            gw_reader, gw_writer = await asyncio.open_connection( GOODWE_HOST, GOODWE_PORT )
-            gw_writer.write( packet )
-            log.debug(f"Relayed packet to {[GOODWE_HOST, GOODWE_PORT]}")
-            reply = await gw_reader.read(1024)
-            log.debug(f"Received reply:\n{hexdump(reply)}")
-            writer.write( reply )
+        try:
+            await parse_packet( packet, addr )
+        finally:
+            # Relay after parsing, so HA updates first and a slow or
+            # unreachable GoodWe server can't hold up local data
+            if config_entry.options.get( CONF_RELAY, False ):
+                await relay_packet( packet, writer, addr )
 
+
+    async def parse_packet( packet, addr ):
         if len(packet) < 0x46:
             log.warning(f"Truncated packet ({len(packet)} bytes) from {addr}, discarding")
             return

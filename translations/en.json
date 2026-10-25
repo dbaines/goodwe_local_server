@@ -1,0 +1,18 @@
+{
+  "options": {
+    "step": {
+      "init": {
+        "title": "GoodWe Local Server",
+        "description": "Packets are always decoded locally first. Relaying is best effort: if GoodWe's server can't be reached, local sensors keep working.",
+        "data": {
+          "relay": "Relay packets to GoodWe (SEMS)",
+          "relay_replies": "Pass GoodWe's replies back to devices"
+        },
+        "data_description": {
+          "relay": "Forward every packet to tcp.goodwe-power.com so the SEMS portal keeps receiving data.",
+          "relay_replies": "Lets GoodWe send time sync and remote firmware updates to devices. Leave off unless needed."
+        }
+      }
+    }
+  }
+}
