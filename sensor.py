@@ -28,7 +28,7 @@ GOODWE_DNS_TTL = 3600
 
 AES_KEY = b'\xff' * 16
 
-SENSOR_TIMEOUT = 300
+SENSOR_TIMEOUT = 180
 
 log = logging.getLogger(__package__)
 
